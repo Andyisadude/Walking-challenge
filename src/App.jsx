@@ -1,15 +1,17 @@
-import { useState, useEffect, useCallback } from "react";
-import { db } from "./firebase.js";
-import { doc, getDoc, setDoc, deleteField, updateDoc } from "firebase/firestore";
+import React, { useState, useEffect } from "react";
+import { db, storage } from "./firebase.js";
+import { doc, getDoc, setDoc, collection, getDocs, deleteDoc } from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 
 const CAMPUSES = [
   "Lemley Memorial", "Broken Arrow", "Owasso", "Peoria",
-  "Riverside", "Sand Springs", "Health Sciences Center",
+  "Riverside", "Sand Springs", "Health Sciences Center", "High School Extension Programs",
 ];
 const SESSIONS = ["AM", "PM", "All Day"];
 const TABS = [
   "Submit Steps", "Campus Average", "Highest Steps",
-  "Highest Steps AM", "Highest Steps PM", "Highest Steps All Day", "Admin",
+  "Highest Steps AM", "Highest Steps PM", "Highest Steps All Day",
+  "All Students", "My Submissions", "Admin",
 ];
 
 const ADMIN_USER = "Student Advisory";
@@ -20,34 +22,119 @@ function minDateStr() { return "2026-01-01"; }
 function maxDateStr() { return "2026-12-31"; }
 
 // ─── Firebase helpers ──────────────────────────────────────────────────────
-// All student records live in a single Firestore document: "data/students"
-// Structure: { [studentId]: { name, campus, session, totalSteps, submittedDates[], dailyScreenshots:{} } }
+// Each student has their own Firestore document: collection "students", doc = studentId
+// This avoids the 1MB per-document limit entirely and scales to any number of students
 
-const DATA_REF = () => doc(db, "data", "students");
 
-async function loadData() {
+const STUDENTS_COL = "students";
+const studentRef = (id) => doc(db, STUDENTS_COL, id);
+
+const CACHE_KEY = "ttswc_cache";
+const CACHE_TTL = 25000; // 25 seconds
+
+async function loadData({ forceRefresh = false } = {}) {
+  // Return cached data immediately if it's fresh enough
+  if (!forceRefresh) {
+    try {
+      const raw = sessionStorage.getItem(CACHE_KEY);
+      if (raw) {
+        const { ts, students } = JSON.parse(raw);
+        if (Date.now() - ts < CACHE_TTL) return { students };
+      }
+    } catch (_) {}
+  }
   try {
-    const snap = await getDoc(DATA_REF());
-    return { students: snap.exists() ? snap.data() : {} };
+    const snap = await getDocs(collection(db, STUDENTS_COL));
+    const students = {};
+    snap.forEach(d => { students[d.id] = d.data(); });
+    // Cache the result
+    try { sessionStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), students })); } catch (_) {}
+    return { students };
   } catch (e) {
     console.error("Firebase load error:", e);
     return { students: {} };
   }
 }
 
-async function saveStudents(students) {
+function invalidateCache() {
+  try { sessionStorage.removeItem(CACHE_KEY); } catch (_) {}
+}
+
+// Save a single student document
+async function saveStudent(studentId, data) {
   try {
-    await setDoc(DATA_REF(), students);
+    await setDoc(studentRef(studentId), data);
+    invalidateCache(); // force next load to re-fetch
+    return true;
   } catch (e) {
     console.error("Firebase save error:", e);
+    return false;
   }
 }
 
+// Delete a single student document
+async function deleteStudent(studentId) {
+  try {
+    await deleteDoc(studentRef(studentId));
+    invalidateCache();
+    return true;
+  } catch (e) {
+    console.error("Firebase delete error:", e);
+    return false;
+  }
+}
+
+// Compress an image file in the browser before uploading
+// Reduces typical 2-4MB phone screenshots down to ~80-120KB
+function compressImage(file, maxWidth = 1280, quality = 0.75) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, maxWidth / img.width);
+      const canvas = document.createElement("canvas");
+      canvas.width  = Math.round(img.width  * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(
+        blob => resolve(blob || file),
+        "image/jpeg",
+        quality
+      );
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+}
+
+// Upload a screenshot to Firebase Storage, compressing it first
+// Retries once on failure to handle transient network issues
+async function uploadScreenshot(file, studentId, date) {
+  const path = `screenshots/${studentId}/${date}_${Date.now()}.jpg`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const compressed = await compressImage(file);
+      const storageRef = ref(storage, path);
+      await uploadBytes(storageRef, compressed, { contentType: "image/jpeg" });
+      const url = await getDownloadURL(storageRef);
+      return url;
+    } catch (e) {
+      console.error(`Screenshot upload error (attempt ${attempt + 1}):`, e);
+      if (attempt === 1) return null;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+  return null;
+}
+
 // ─── Loader ────────────────────────────────────────────────────────────────
-function Loader() {
+function Loader({ message = "Loading..." }) {
   return (
-    <div style={{ display:"flex", justifyContent:"center", padding:"3rem" }}>
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"4rem 2rem", gap:"1rem" }}>
       <div className="spinner" />
+      <div style={{ color:"var(--muted)", fontSize:"0.85rem", fontWeight:600 }}>{message}</div>
     </div>
   );
 }
@@ -61,49 +148,43 @@ function MedalIcon({ rank }) {
 // ─── Leaderboard ───────────────────────────────────────────────────────────
 function LeaderboardTable({ title, students, filter, groupBy }) {
   if (groupBy === "campus") {
+    // Build campus map: for each campus, sum up every individual daily submission
     const campusMap = {};
     Object.values(students).forEach(s => {
-      if (!campusMap[s.campus]) campusMap[s.campus] = { total:0, count:0 };
-      campusMap[s.campus].total += s.totalSteps;
-      campusMap[s.campus].count += 1;
+      if (!campusMap[s.campus]) campusMap[s.campus] = { totalDailySteps:0, totalDays:0, studentCount:0 };
+      const days = s.submittedDates?.length || 0;
+      campusMap[s.campus].totalDailySteps += s.totalSteps;
+      campusMap[s.campus].totalDays      += days;
+      campusMap[s.campus].studentCount   += 1;
     });
 
-    const allStudents = Object.values(students);
-    const globalMean = allStudents.length
-      ? allStudents.reduce((sum, s) => sum + s.totalSteps, 0) / allStudents.length
-      : 0;
-    const campusEntries = Object.values(campusMap);
-    const avgCampusSize = campusEntries.length
-      ? campusEntries.reduce((sum, c) => sum + c.count, 0) / campusEntries.length
-      : 1;
-    const C = Math.max(1, Math.round(avgCampusSize));
-
+    // Daily avg per campus = total steps across all days / total days logged
     const rows = Object.entries(campusMap)
-      .map(([campus, { total, count }]) => ({
+      .map(([campus, { totalDailySteps, totalDays, studentCount }]) => ({
         campus,
-        avg: Math.round((C * globalMean + total) / (C + count)),
-        rawAvg: Math.round(total / count),
-        count,
+        dailyAvg: totalDays > 0 ? Math.round(totalDailySteps / totalDays) : 0,
+        studentCount,
+        totalDays,
       }))
-      .sort((a, b) => b.avg - a.avg);
+      .sort((a, b) => b.dailyAvg - a.dailyAvg);
 
     if (!rows.length) return <div className="empty-state"><span>🏃</span><p>No data yet. Be the first to submit!</p></div>;
     return (
       <div className="leaderboard-wrap">
         <h2 className="lb-title">{title}</h2>
         <p style={{ color:"var(--muted)", fontSize:"0.8rem", marginBottom:"1.25rem", marginTop:"-0.75rem" }}>
-          Ranked by Bayesian average — protects small campuses from outliers while fairly rewarding consistent effort.
+          Ranked by average steps per day across all submissions from that campus.
         </p>
         <table className="lb-table">
-          <thead><tr><th>Rank</th><th>Campus</th><th>Score</th><th>Raw Avg</th><th>Students</th></tr></thead>
+          <thead><tr><th>Rank</th><th>Campus</th><th>Avg Steps/Day</th><th>Total Days</th><th>Students</th></tr></thead>
           <tbody>
             {rows.map((r,i) => (
               <tr key={r.campus} className={i<3?`top-${i+1}`:""}>
                 <td><MedalIcon rank={i+1}/></td>
                 <td>{r.campus}</td>
-                <td className="steps-cell">{r.avg.toLocaleString()}</td>
-                <td style={{ color:"var(--muted)", fontSize:"0.85rem" }}>{r.rawAvg.toLocaleString()}</td>
-                <td>{r.count}</td>
+                <td className="steps-cell">{r.dailyAvg.toLocaleString()}</td>
+                <td style={{ color:"var(--muted)", fontSize:"0.85rem" }}>{r.totalDays}</td>
+                <td>{r.studentCount}</td>
               </tr>
             ))}
           </tbody>
@@ -177,8 +258,114 @@ function AdminLogin({ onLogin }) {
   );
 }
 
+// ─── Edit Student Modal ────────────────────────────────────────────────────
+function EditStudentModal({ student, studentId, onSave, onClose, campuses, sessions }) {
+  const [form, setForm] = useState({
+    name:    student.name,
+    campus:  student.campus,
+    session: student.session,
+  });
+  const [saving, setSaving] = useState(false);
+
+  async function handleSave() {
+    if (!form.name.trim()) return;
+    setSaving(true);
+    await onSave(studentId, form);
+    setSaving(false);
+    onClose();
+  }
+
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:"1.5rem" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:"16px", padding:"2rem", width:"100%", maxWidth:"500px" }}>
+        <h3 style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.6rem", letterSpacing:"0.05em", marginBottom:"1.5rem" }}>✏️ Edit Student</h3>
+        <div style={{ display:"flex", flexDirection:"column", gap:"1rem" }}>
+          <div className="field">
+            <label>Full Name</label>
+            <input type="text" value={form.name} onChange={e => setForm(f => ({ ...f, name:e.target.value }))} placeholder="Full name" />
+          </div>
+          <div className="field">
+            <label>Session</label>
+            <div className="radio-group">
+              {sessions.map(s => (
+                <label key={s} className={`radio-card ${form.session===s?"selected":""}`}>
+                  <input type="radio" name="edit-session" value={s} checked={form.session===s} onChange={() => setForm(f => ({ ...f, session:s }))} />{s}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="field">
+            <label>Campus</label>
+            <div className="campus-grid">
+              {campuses.map(c => (
+                <label key={c} className={`campus-card ${form.campus===c?"selected":""}`}>
+                  <input type="radio" name="edit-campus" value={c} checked={form.campus===c} onChange={() => setForm(f => ({ ...f, campus:c }))} />
+                  <span>🏫</span>{c}
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:"0.75rem", marginTop:"1.75rem" }}>
+          <button onClick={handleSave} disabled={saving} className="submit-btn" style={{ margin:0 }}>
+            {saving ? "Saving..." : "Save Changes ✓"}
+          </button>
+          <button onClick={onClose} className="cancel-btn" style={{ padding:"0.9rem 1.25rem", fontSize:"0.9rem" }}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Edit Day Modal ─────────────────────────────────────────────────────────
+function EditDayModal({ studentId, date, entry, existingDates, onSave, onClose }) {
+  const [steps, setSteps]   = useState(String(entry?.steps || ""));
+  const [newDate, setNewDate] = useState(date);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr]       = useState("");
+
+  async function handleSave() {
+    const n = Number(steps);
+    if (!steps || n < 1000) { setErr("Minimum 1,000 steps required"); return; }
+    if (!newDate) { setErr("Date is required"); return; }
+    if (newDate !== date && existingDates.includes(newDate)) {
+      setErr(`A submission for ${newDate} already exists for this student`); return;
+    }
+    setSaving(true);
+    await onSave(studentId, date, n, newDate);
+    setSaving(false);
+    onClose();
+  }
+
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:"1.5rem" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:"16px", padding:"2rem", width:"100%", maxWidth:"380px" }}>
+        <h3 style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.6rem", letterSpacing:"0.05em", marginBottom:"1.5rem" }}>✏️ Edit Day</h3>
+        {entry?.img && (
+          <img src={entry.img} alt="Screenshot" style={{ width:"100%", maxHeight:"160px", objectFit:"cover", borderRadius:"8px", marginBottom:"1rem", border:"1px solid var(--border)" }} />
+        )}
+        <div className="field" style={{ marginBottom:"1rem" }}>
+          <label>Date <span className="req-note">* Any date in 2026</span></label>
+          <input type="date" value={newDate} min="2026-01-01" max="2026-12-31" onChange={e => { setNewDate(e.target.value); setErr(""); }} />
+        </div>
+        <div className="field" style={{ marginBottom:"1rem" }}>
+          <label>Step Count <span className="req-note">* Minimum 1,000</span></label>
+          <input type="number" value={steps} min="1000" onChange={e => { setSteps(e.target.value); setErr(""); }} placeholder="e.g. 8000" />
+          {err && <span className="err">{err}</span>}
+        </div>
+        <div style={{ display:"flex", gap:"0.75rem", marginTop:"1.25rem" }}>
+          <button onClick={handleSave} disabled={saving} className="submit-btn" style={{ margin:0 }}>
+            {saving ? "Saving..." : "Save Changes ✓"}
+          </button>
+          <button onClick={onClose} className="cancel-btn" style={{ padding:"0.9rem 1.25rem", fontSize:"0.9rem" }}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Admin Panel ───────────────────────────────────────────────────────────
-function AdminPanel({ students, onDelete, onDeleteDay, onLogout }) {
+function AdminPanel({ students, onDelete, onDeleteDay, onEditStudent, onEditDay, onLogout }) {
   const [search, setSearch]         = useState("");
   const [dateFilter, setDateFilter] = useState("");
   const [confirmId, setConfirmId]   = useState(null);
@@ -186,6 +373,8 @@ function AdminPanel({ students, onDelete, onDeleteDay, onLogout }) {
   const [deleted, setDeleted]       = useState("");
   const [expanded, setExpanded]     = useState(null);
   const [lightbox, setLightbox]     = useState(null);
+  const [editStudent, setEditStudent] = useState(null);   // { studentId, student }
+  const [editDay, setEditDay]         = useState(null);   // { studentId, date, entry }
 
   const list = Object.entries(students)
     .map(([id, s]) => ({ id, ...s }))
@@ -231,6 +420,39 @@ function AdminPanel({ students, onDelete, onDeleteDay, onLogout }) {
         </div>
       )}
 
+      {editStudent && (
+        <EditStudentModal
+          studentId={editStudent.studentId}
+          student={editStudent.student}
+          campuses={["Lemley Memorial","Broken Arrow","Owasso","Peoria","Riverside","Sand Springs","Health Sciences Center","High School Extension Programs"]}
+          sessions={["AM","PM","All Day"]}
+          onSave={async (id, data) => {
+            await onEditStudent(id, data);
+            setDeleted(`"${data.name}" updated successfully.`);
+            setTimeout(() => setDeleted(""), 4000);
+          }}
+          onClose={() => setEditStudent(null)}
+        />
+      )}
+
+      {editDay && (
+        <EditDayModal
+          studentId={editDay.studentId}
+          date={editDay.date}
+          entry={editDay.entry}
+          existingDates={students[editDay.studentId]?.submittedDates || []}
+          onSave={async (studentId, date, newSteps, newDate) => {
+            await onEditDay(studentId, date, newSteps, newDate);
+            const msg = newDate !== date
+              ? `Day moved from ${date} to ${newDate} with ${newSteps.toLocaleString()} steps.`
+              : `Day ${date} updated to ${newSteps.toLocaleString()} steps.`;
+            setDeleted(msg);
+            setTimeout(() => setDeleted(""), 4000);
+          }}
+          onClose={() => setEditDay(null)}
+        />
+      )}
+
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"1.5rem", flexWrap:"wrap", gap:"1rem" }}>
         <h2 className="lb-title" style={{ marginBottom:0 }}>🛡️ Admin Panel</h2>
         <button onClick={onLogout} className="logout-btn">Sign Out</button>
@@ -271,7 +493,7 @@ function AdminPanel({ students, onDelete, onDeleteDay, onLogout }) {
           )}
           <table className="lb-table">
             <thead>
-              <tr><th>Student ID</th><th>Name</th><th>Campus</th><th>Session</th><th>Days Logged</th><th>Total Steps</th><th>Details</th><th>Action</th></tr>
+              <tr><th>Student ID</th><th>Name</th><th>Campus</th><th>Session</th><th>Days Logged</th><th>Total Steps</th><th>Details</th><th>Actions</th></tr>
             </thead>
             <tbody>
               {list.map(s => (
@@ -289,14 +511,17 @@ function AdminPanel({ students, onDelete, onDeleteDay, onLogout }) {
                       </button>
                     </td>
                     <td>
-                      {confirmId === s.id ? (
-                        <div style={{ display:"flex", gap:"0.4rem" }}>
-                          <button className="confirm-del-btn" onClick={() => handleDelete(s.id)}>Yes, Delete</button>
-                          <button className="cancel-btn" onClick={() => setConfirmId(null)}>Cancel</button>
-                        </div>
-                      ) : (
-                        <button className="delete-btn" onClick={() => setConfirmId(s.id)}>🗑 Delete</button>
-                      )}
+                      <div style={{ display:"flex", gap:"0.4rem", flexWrap:"wrap" }}>
+                        <button className="edit-btn" onClick={() => setEditStudent({ studentId: s.id, student: students[s.id] })}>✏️ Edit</button>
+                        {confirmId === s.id ? (
+                          <>
+                            <button className="confirm-del-btn" onClick={() => handleDelete(s.id)}>Yes, Delete</button>
+                            <button className="cancel-btn" onClick={() => setConfirmId(null)}>Cancel</button>
+                          </>
+                        ) : (
+                          <button className="delete-btn" onClick={() => setConfirmId(s.id)}>🗑 Delete</button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                   {expanded === s.id && s.submittedDates && (
@@ -315,6 +540,7 @@ function AdminPanel({ students, onDelete, onDeleteDay, onLogout }) {
                                 ) : (
                                   <div className="day-no-img">No image</div>
                                 )}
+                                <button className="edit-btn" style={{ fontSize:"0.7rem", padding:"0.3rem 0.5rem", marginTop:"0.25rem" }} onClick={() => setEditDay({ studentId: s.id, date, entry })}>✏️ Edit Steps</button>
                                 {isDayConfirm ? (
                                   <div style={{ display:"flex", gap:"0.3rem", marginTop:"0.25rem" }}>
                                     <button className="confirm-del-btn" style={{ fontSize:"0.7rem", padding:"0.3rem 0.5rem" }} onClick={() => handleDayDelete(s.id, date)}>Yes</button>
@@ -334,6 +560,232 @@ function AdminPanel({ students, onDelete, onDeleteDay, onLogout }) {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── All Students Leaderboard ──────────────────────────────────────────────
+function AllStudentsLeaderboard({ students }) {
+  const [sessionFilter, setSessionFilter] = useState("All");
+  const [search, setSearch]               = useState("");
+  const highlightRef                      = React.useRef(null);
+
+  // Full ranked list (session filter only, no hiding by search)
+  const ranked = Object.entries(students)
+    .map(([id, s]) => ({ id, ...s }))
+    .filter(s => sessionFilter === "All" || s.session === sessionFilter)
+    .sort((a, b) => b.totalSteps - a.totalSteps);
+
+  const searchLower = search.trim().toLowerCase();
+  // Index of the highlighted row (-1 if none)
+  const highlightIdx = searchLower
+    ? ranked.findIndex(s => s.name.toLowerCase().includes(searchLower))
+    : -1;
+
+  // Scroll to highlighted row whenever it changes
+  React.useEffect(() => {
+    if (highlightRef.current) {
+      highlightRef.current.scrollIntoView({ behavior:"smooth", block:"center" });
+    }
+  }, [highlightIdx]);
+
+  return (
+    <div className="leaderboard-wrap">
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"1rem", flexWrap:"wrap", gap:"1rem" }}>
+        <h2 className="lb-title" style={{ marginBottom:0 }}>🏅 All Students</h2>
+        <div style={{ display:"flex", alignItems:"center", gap:"0.6rem" }}>
+          <label style={{ fontSize:"0.78rem", fontWeight:700, letterSpacing:"0.05em", textTransform:"uppercase", color:"var(--muted)" }}>Session</label>
+          <select
+            value={sessionFilter}
+            onChange={e => setSessionFilter(e.target.value)}
+            style={{ background:"var(--surface2)", border:"1px solid var(--border)", color:"var(--text)", fontFamily:"'DM Sans',sans-serif", fontSize:"0.9rem", padding:"0.5rem 0.9rem", borderRadius:"8px", cursor:"pointer", outline:"none" }}
+          >
+            <option value="All">All Sessions</option>
+            <option value="AM">AM</option>
+            <option value="PM">PM</option>
+            <option value="All Day">All Day</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Search bar — highlights your row, doesn't hide others */}
+      <div className="field" style={{ marginBottom:"1.25rem", maxWidth:"360px" }}>
+        <label>Find Yourself</label>
+        <input
+          type="text"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="Type your name to highlight your row..."
+        />
+        {search && highlightIdx === -1 && (
+          <span className="err">No match found in this session filter</span>
+        )}
+        {search && highlightIdx !== -1 && (
+          <span style={{ fontSize:"0.78rem", color:"var(--accent2)", fontWeight:600 }}>
+            ✓ You are ranked #{highlightIdx + 1} of {ranked.length}
+          </span>
+        )}
+      </div>
+
+      {ranked.length === 0 ? (
+        <div className="empty-state"><span>🏃</span><p>No students found for this session.</p></div>
+      ) : (
+        <table className="lb-table">
+          <thead>
+            <tr><th>Rank</th><th>Name</th><th>Campus</th><th>Session</th><th>Days Logged</th><th>Total Steps</th></tr>
+          </thead>
+          <tbody>
+            {ranked.map((s, i) => {
+              const isHighlighted = i === highlightIdx;
+              return (
+                <tr
+                  key={s.id}
+                  ref={isHighlighted ? highlightRef : null}
+                  className={isHighlighted ? "row-highlight" : i<3 ? `top-${i+1}` : ""}
+                >
+                  <td><MedalIcon rank={i+1}/></td>
+                  <td><strong>{s.name}</strong>{isHighlighted && <span style={{ marginLeft:"0.5rem", fontSize:"0.72rem", background:"var(--accent)", color:"#fff", padding:"0.1rem 0.4rem", borderRadius:"4px", fontWeight:700 }}>YOU</span>}</td>
+                  <td>{s.campus}</td>
+                  <td><span className={`badge badge-${s.session.replace(" ","")}`}>{s.session}</span></td>
+                  <td style={{ textAlign:"center" }}>{s.submittedDates?.length || 0}</td>
+                  <td className="steps-cell">{s.totalSteps.toLocaleString()}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ─── My Submissions ─────────────────────────────────────────────────────────
+function MySubmissions({ students }) {
+  const [studentId, setStudentId] = useState("");
+  const [name, setName]           = useState("");
+  const [result, setResult]       = useState(null);   // null | "found" | "notfound" | "mismatch"
+  const [student, setStudent]     = useState(null);
+
+  function normalize(str) {
+    return str.trim().toLowerCase().replace(/\s+/g, " ");
+  }
+
+  function handleLookup() {
+    const sid = studentId.trim();
+    const nm  = normalize(name);
+    if (!sid || !nm) return;
+
+    // Students object may still be loading
+    if (Object.keys(students).length === 0) {
+      setResult("notfound");
+      setStudent(null);
+      return;
+    }
+
+    const s = students[sid];
+    if (!s) { setResult("notfound"); setStudent(null); return; }
+
+    // Case-insensitive, whitespace-normalized name match
+    const storedName = normalize(s.name);
+    if (storedName !== nm && !storedName.includes(nm) && !nm.includes(storedName)) {
+      setResult("mismatch");
+      setStudent(null);
+      return;
+    }
+    setResult("found");
+    setStudent({ ...s, id: sid });
+  }
+
+  return (
+    <div style={{ maxWidth:"680px", margin:"0 auto" }}>
+      <div className="form-header">
+        <div className="form-icon">📋</div>
+        <h2>My Submissions</h2>
+        <p>Enter your Student ID and full name to view your step history</p>
+      </div>
+
+      <div className="step-form" style={{ marginBottom:"1.5rem" }}>
+        <div className="form-grid">
+          <div className="field">
+            <label>Student ID</label>
+            <input
+              type="text"
+              value={studentId}
+              onChange={e => { setStudentId(e.target.value); setResult(null); }}
+              placeholder="Enter your student ID"
+              autoComplete="off"
+              onKeyDown={e => e.key === "Enter" && handleLookup()}
+            />
+          </div>
+          <div className="field">
+            <label>Full Name</label>
+            <input
+              type="text"
+              value={name}
+              onChange={e => { setName(e.target.value); setResult(null); }}
+              placeholder="Enter your full name"
+              autoComplete="off"
+              onKeyDown={e => e.key === "Enter" && handleLookup()}
+            />
+          </div>
+        </div>
+        <button onClick={handleLookup} className="submit-btn" disabled={!studentId.trim() || !name.trim()}>
+          Look Up My Steps 🔍
+        </button>
+      </div>
+
+      {result === "notfound" && (
+        <div className="error-banner">⚠️ No record found for that Student ID. Make sure you&apos;re entering the exact same Student ID you used when submitting.</div>
+      )}
+      {result === "mismatch" && (
+        <div className="error-banner">⚠️ The name you entered doesn't match our records for that Student ID. Make sure you enter your name exactly as you did when you first submitted steps.</div>
+      )}
+
+      {result === "found" && student && (
+        <div style={{ animation:"fadeIn 0.35s ease" }}>
+          {/* Summary card */}
+          <div style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:"14px", padding:"1.5rem", marginBottom:"1.5rem" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", flexWrap:"wrap", gap:"1rem", marginBottom:"1.25rem" }}>
+              <div>
+                <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.6rem", letterSpacing:"0.05em" }}>{student.name}</div>
+                <div style={{ color:"var(--muted)", fontSize:"0.85rem" }}>{student.campus} · <span className={`badge badge-${student.session.replace(" ","")}`}>{student.session}</span></div>
+              </div>
+              <div style={{ textAlign:"right" }}>
+                <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"2.2rem", color:"var(--accent)", letterSpacing:"0.05em" }}>{student.totalSteps.toLocaleString()}</div>
+                <div style={{ color:"var(--muted)", fontSize:"0.72rem", textTransform:"uppercase", letterSpacing:"0.1em" }}>Total Steps</div>
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:"1.5rem", flexWrap:"wrap" }}>
+              <div><span style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.3rem", color:"var(--accent2)" }}>{student.submittedDates?.length || 0}</span> <span style={{ color:"var(--muted)", fontSize:"0.8rem" }}>Days Logged</span></div>
+              <div><span style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.3rem", color:"var(--accent2)" }}>{student.submittedDates?.length ? Math.round(student.totalSteps / student.submittedDates.length).toLocaleString() : 0}</span> <span style={{ color:"var(--muted)", fontSize:"0.8rem" }}>Daily Avg Steps</span></div>
+              <div><span style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.3rem", color:"var(--accent2)" }}>{(() => { const days = student.submittedDates; if (!days?.length) return 0; const sorted = [...days].sort(); const first = new Date(sorted[0]); const last = new Date(sorted[sorted.length-1]); const span = Math.max(1, Math.round((last-first)/(1000*60*60*24))+1); return span; })()}</span> <span style={{ color:"var(--muted)", fontSize:"0.8rem" }}>Day Streak Span</span></div>
+            </div>
+          </div>
+
+          {/* Day-by-day history */}
+          <h3 style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.4rem", letterSpacing:"0.05em", marginBottom:"1rem" }}>📅 Submission History</h3>
+          {(!student.submittedDates || student.submittedDates.length === 0) ? (
+            <p style={{ color:"var(--muted)" }}>No submissions yet.</p>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", gap:"0.6rem" }}>
+              {[...student.submittedDates].sort().reverse().map(date => {
+                const entry = student.dailyScreenshots?.[date];
+                return (
+                  <div key={date} style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:"10px", padding:"0.9rem 1.1rem", display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:"0.5rem" }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:"0.75rem" }}>
+                      <span style={{ fontSize:"1.1rem" }}>📅</span>
+                      <span style={{ fontWeight:600 }}>{date}</span>
+                    </div>
+                    <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:"1.3rem", color:"var(--accent)", letterSpacing:"0.05em" }}>
+                      {entry?.steps?.toLocaleString() || "?"} steps
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -388,20 +840,30 @@ function SubmitForm({ onSubmit, students }) {
   async function handleSubmit() {
     setSubmitError("");
     const errs = validate();
-    if (Object.keys(errs).length) { setErrors(errs); return; }
-    const sid = form.studentId.trim();
-    const existing = students[sid];
-    if (existing?.submittedDates?.includes(form.date)) {
-      setSubmitError(`You have already submitted steps for ${form.date}. Only one submission per day is allowed.`);
+    if (Object.keys(errs).length) {
+      setErrors(errs);
+      // Scroll to the first error so mobile users see it
+      setTimeout(() => {
+        const el = document.querySelector(".has-error");
+        if (el) el.scrollIntoView({ behavior:"smooth", block:"center" });
+      }, 50);
       return;
     }
+    const sid = form.studentId.trim();
     setSubmitting(true);
-    const result = await onSubmit({ ...form, studentId:sid, screenshotPreview:preview });
+    const result = await onSubmit({ ...form, studentId:sid, screenshotFile:screenshot });
     setSubmitting(false);
-    if (result?.error) { setSubmitError(result.error); return; }
+    if (result?.error) {
+      setSubmitError(result.error);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
     setSuccess(true);
     setForm({ studentId:"", name:"", date:today, steps:"", session:"", campus:"" });
     setScreenshot(null); setPreview(null);
+    // Reset the file input element so the same file can be re-uploaded if needed
+    const fileInput = document.getElementById("ss-input");
+    if (fileInput) fileInput.value = "";
     setTimeout(() => setSuccess(false), 5000);
   }
 
@@ -433,7 +895,7 @@ function SubmitForm({ onSubmit, students }) {
           </div>
           <div className={`field ${errors.steps?"has-error":""}`}>
             <label>Step Count <span className="req-note">* Minimum 1,000 steps</span></label>
-            <input type="number" name="steps" value={form.steps} onChange={handleChange} placeholder="e.g. 10000" min="1000" />
+            <input type="number" name="steps" value={form.steps} onChange={handleChange} placeholder="e.g. 10000" min="1000" max="100000" onKeyDown={e => ["-","e","E","+"].includes(e.key) && e.preventDefault()} />
             {errors.steps && <span className="err">{errors.steps}</span>}
           </div>
           <div className={`field full-width ${errors.session?"has-error":""}`}>
@@ -472,7 +934,7 @@ function SubmitForm({ onSubmit, students }) {
           </div>
         </div>
         <button onClick={handleSubmit} className="submit-btn" disabled={submitting}>
-          {submitting ? "Submitting..." : "Submit My Steps 🏃"}
+          {submitting ? "Uploading & Saving..." : "Submit My Steps 🏃"}
         </button>
       </div>
     </div>
@@ -486,35 +948,89 @@ export default function App() {
   const [loading, setLoading]         = useState(true);
   const [adminAuthed, setAdminAuthed] = useState(false);
 
+  const submittingRef  = React.useRef(false);
+  const studentsRef    = React.useRef({});
+
+  useEffect(() => {
+    studentsRef.current = students;
+  }, [students]);
+
   useEffect(() => {
     loadData().then(({ students }) => { setStudents(students); setLoading(false); });
+    // Refresh leaderboard data every 60 seconds — cache handles sub-minute reads
+    const interval = setInterval(() => {
+      if (!submittingRef.current) {
+        loadData({ forceRefresh: true }).then(({ students }) => setStudents(students));
+      }
+    }, 60000);
+    return () => clearInterval(interval);
   }, []);
 
-  const handleSubmit = useCallback(async (formData) => {
-    const { studentId, name, campus, session, steps, date, screenshotPreview } = formData;
+  const handleSubmit = async (formData) => {
+    const { studentId, name, campus, session, steps, date, screenshotFile } = formData;
     const stepCount = Number(steps);
-    const existing = students[studentId];
-    if (existing?.submittedDates?.includes(date))
-      return { error:`Already submitted steps for ${date}. Only one submission per day is allowed.` };
-    const prevScreenshots = existing?.dailyScreenshots || {};
-    const updatedStudent = existing
-      ? { ...existing, name, campus, session, totalSteps: existing.totalSteps + stepCount, submittedDates: [...existing.submittedDates, date], dailyScreenshots: { ...prevScreenshots, [date]: { steps: stepCount, img: screenshotPreview } } }
-      : { name, campus, session, totalSteps: stepCount, submittedDates: [date], dailyScreenshots: { [date]: { steps: stepCount, img: screenshotPreview } } };
-    const newStudents = { ...students, [studentId]: updatedStudent };
-    setStudents(newStudents);
-    await saveStudents(newStudents);
-    return { success: true };
-  }, [students]);
 
-  const handleDelete = useCallback(async (studentId) => {
-    const newStudents = { ...students };
+    submittingRef.current = true;
+    try {
+      // Step 1: Upload screenshot to Firebase Storage
+      let imgUrl = null;
+      if (screenshotFile) {
+        try {
+          imgUrl = await uploadScreenshot(screenshotFile, studentId, date);
+        } catch (e) {
+          console.error("Upload threw:", e);
+        }
+        if (!imgUrl) {
+          return { error: "Screenshot upload failed. Please check that Firebase Storage is enabled in your Firebase console (Build → Storage) and that your Storage rules allow writes. Then try again." };
+        }
+      }
+
+      // Step 2: Load fresh data (bypass cache — always get latest before saving)
+      let freshStudents = {};
+      try {
+        const result = await loadData({ forceRefresh: true });
+        freshStudents = result.students;
+      } catch (e) {
+        console.error("Load threw:", e);
+        return { error: "Could not reach the database. Please check your internet connection and try again." };
+      }
+
+      // Step 3: Duplicate check
+      const existing = freshStudents[studentId];
+      if (existing?.submittedDates?.includes(date))
+        return { error: `Already submitted steps for ${date}. Only one submission per day is allowed.` };
+
+      // Step 4: Build updated student record
+      const prevScreenshots = existing?.dailyScreenshots || {};
+      const updatedStudent = existing
+        ? { ...existing, name, campus, session, totalSteps: existing.totalSteps + stepCount, submittedDates: [...existing.submittedDates, date], dailyScreenshots: { ...prevScreenshots, [date]: { steps: stepCount, img: imgUrl } } }
+        : { name, campus, session, totalSteps: stepCount, submittedDates: [date], dailyScreenshots: { [date]: { steps: stepCount, img: imgUrl } } };
+
+      // Step 5: Save to Firestore
+      const saved = await saveStudent(studentId, updatedStudent);
+      if (!saved) {
+        return { error: "Saved screenshot but failed to save to database. Please check your Firestore rules allow writes to the 'students' collection, then try again." };
+      }
+
+      setStudents({ ...freshStudents, [studentId]: updatedStudent });
+      return { success: true };
+    } catch (e) {
+      console.error("Unexpected submit error:", e);
+      return { error: `Unexpected error: ${e.message || "Unknown error"}. Please try again.` };
+    } finally {
+      submittingRef.current = false;
+    }
+  };
+
+  const handleDelete = async (studentId) => {
+    await deleteStudent(studentId);
+    const newStudents = { ...studentsRef.current };
     delete newStudents[studentId];
     setStudents(newStudents);
-    await saveStudents(newStudents);
-  }, [students]);
+  };
 
-  const handleDeleteDay = useCallback(async (studentId, date) => {
-    const s = students[studentId];
+  const handleDeleteDay = async (studentId, date) => {
+    const s = studentsRef.current[studentId];
     if (!s) return;
     const entry = s.dailyScreenshots?.[date];
     const stepsToRemove = entry?.steps || 0;
@@ -522,31 +1038,66 @@ export default function App() {
     const newScreenshots = { ...s.dailyScreenshots };
     delete newScreenshots[date];
     const newTotal = Math.max(0, s.totalSteps - stepsToRemove);
-    const newStudents = { ...students };
+    const newStudents = { ...studentsRef.current };
     if (newDates.length === 0) {
       delete newStudents[studentId];
+      await deleteStudent(studentId);
     } else {
       newStudents[studentId] = { ...s, totalSteps: newTotal, submittedDates: newDates, dailyScreenshots: newScreenshots };
+      await saveStudent(studentId, newStudents[studentId]);
     }
     setStudents(newStudents);
-    await saveStudents(newStudents);
-  }, [students]);
+  };
+
+  // Edit student profile (name, campus, session) — does NOT touch step totals
+  const handleEditStudent = async (studentId, { name, campus, session }) => {
+    const s = studentsRef.current[studentId];
+    if (!s) return;
+    const updated = { ...s, name, campus, session };
+    await saveStudent(studentId, updated);
+    setStudents({ ...studentsRef.current, [studentId]: updated });
+  };
+
+  // Edit a specific day's step count and/or date — recalculates the student's total
+  const handleEditDay = async (studentId, oldDate, newSteps, newDate) => {
+    const s = studentsRef.current[studentId];
+    if (!s) return;
+    const oldSteps = s.dailyScreenshots?.[oldDate]?.steps || 0;
+    const newTotal = Math.max(0, s.totalSteps - oldSteps + newSteps);
+    // Remove old date entry, add new one (may be same date)
+    const oldScreenshots = { ...s.dailyScreenshots };
+    const oldEntry = oldScreenshots[oldDate] || {};
+    delete oldScreenshots[oldDate];
+    const newDates = s.submittedDates.filter(d => d !== oldDate);
+    if (!newDates.includes(newDate)) newDates.push(newDate);
+    const updatedS = {
+      ...s,
+      totalSteps: newTotal,
+      submittedDates: newDates,
+      dailyScreenshots: {
+        ...oldScreenshots,
+        [newDate]: { ...oldEntry, steps: newSteps },
+      },
+    };
+    await saveStudent(studentId, updatedS);
+    setStudents({ ...studentsRef.current, [studentId]: updatedS });
+  };
 
   const allList       = Object.values(students);
   const totalStudents = allList.length;
-  const highestSteps  = allList.length ? Math.max(...allList.map(s => s.totalSteps)) : 0;
-  const avgSteps      = allList.length ? Math.round(allList.reduce((a,s) => a+s.totalSteps,0)/allList.length) : 0;
+  const totalSteps    = allList.reduce((a, s) => a + s.totalSteps, 0);
+  const avgSteps      = allList.length ? Math.round(totalSteps / allList.length) : 0;
 
   return (
     <>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;700&display=swap');
         *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
-        :root { --bg:#0a0000; --surface:#130000; --surface2:#1c0000; --border:#3a0a0a; --accent:#e81c1c; --accent2:#ff5252; --accent3:#ff8a00; --text:#f5e8e8; --muted:#8a6060; }
+        :root { --bg:#000000; --surface:#111111; --surface2:#1a1a1a; --border:#333333; --accent:#e81c1c; --accent2:#ff3333; --accent3:#ff5555; --text:#ffffff; --muted:#888888; }
         body { background:var(--bg); color:var(--text); font-family:'DM Sans',sans-serif; min-height:100vh; }
-        .hero { background:linear-gradient(135deg,#0a0000 0%,#1a0000 50%,#0f0000 100%); border-bottom:1px solid var(--border); padding:2.5rem 1.5rem 0; position:relative; overflow:hidden; }
-        .hero::before { content:''; position:absolute; top:-60%; left:-20%; width:60%; height:200%; background:radial-gradient(ellipse,rgba(232,28,28,0.12) 0%,transparent 70%); pointer-events:none; }
-        .hero::after  { content:''; position:absolute; top:-40%; right:-10%; width:50%; height:180%; background:radial-gradient(ellipse,rgba(180,0,0,0.08) 0%,transparent 70%); pointer-events:none; }
+        .hero { background:linear-gradient(135deg,#000000 0%,#111111 50%,#000000 100%); border-bottom:1px solid var(--border); padding:2.5rem 1.5rem 0; position:relative; overflow:hidden; }
+        .hero::before { content:''; position:absolute; top:-60%; left:-20%; width:60%; height:200%; background:radial-gradient(ellipse,rgba(232,28,28,0.15) 0%,transparent 70%); pointer-events:none; }
+        .hero::after  { content:''; position:absolute; top:-40%; right:-10%; width:50%; height:180%; background:radial-gradient(ellipse,rgba(232,28,28,0.08) 0%,transparent 70%); pointer-events:none; }
         .hero-inner { max-width:1100px; margin:0 auto; position:relative; z-index:1; }
         .hero-badge { display:inline-flex; align-items:center; gap:0.4rem; background:rgba(232,28,28,0.12); border:1px solid rgba(232,28,28,0.4); color:var(--accent2); font-size:0.75rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; padding:0.3rem 0.8rem; border-radius:100px; margin-bottom:1rem; }
         .hero h1 { font-family:'Bebas Neue',cursive; font-size:clamp(2rem,5.5vw,4rem); line-height:1; letter-spacing:0.02em; color:var(--text); margin-bottom:0.5rem; }
@@ -582,8 +1133,8 @@ export default function App() {
         .req-note { font-size:0.68rem; font-weight:500; text-transform:none; letter-spacing:0; color:var(--accent2); margin-left:0.3rem; }
         input[type="text"], input[type="number"], input[type="date"], input[type="password"] { background:var(--surface2); border:1px solid var(--border); color:var(--text); font-family:'DM Sans',sans-serif; font-size:0.95rem; padding:0.75rem 1rem; border-radius:8px; outline:none; transition:border-color 0.2s; width:100%; -webkit-text-fill-color:var(--text); }
         input[type="text"]::placeholder, input[type="number"]::placeholder, input[type="password"]::placeholder { color:var(--muted); opacity:1; }
-        input[type="text"] { background:var(--surface2); color:#000; -webkit-text-fill-color:#000; }
-        input[type="text"]::placeholder { color:#666; }
+        input[type="text"] { background:var(--surface2); color:#ffffff; -webkit-text-fill-color:#ffffff; }
+        input[type="text"]::placeholder { color:#888; }
         input[type="text"]:focus, input[type="number"]:focus, input[type="date"]:focus, input[type="password"]:focus { border-color:var(--accent); }
         .has-error input, .has-error .upload-zone { border-color:#ff4f4f !important; }
         .err { font-size:0.78rem; color:#ff6b6b; font-weight:500; }
@@ -616,6 +1167,7 @@ export default function App() {
         .lb-table tbody tr.top-1 { background:rgba(255,215,0,0.06); }
         .lb-table tbody tr.top-2 { background:rgba(192,192,192,0.05); }
         .lb-table tbody tr.top-3 { background:rgba(205,127,50,0.05); }
+        .lb-table tbody tr.row-highlight { background:rgba(232,28,28,0.18); outline:2px solid var(--accent); outline-offset:-2px; }
         .lb-table tbody td { padding:0.9rem 1rem; font-size:0.9rem; vertical-align:middle; }
         .lb-table tbody td:first-child { border-radius:10px 0 0 10px; }
         .lb-table tbody td:last-child  { border-radius:0 10px 10px 0; }
@@ -646,6 +1198,9 @@ export default function App() {
         .cancel-btn:hover { color:var(--text); }
         .view-btn { background:rgba(255,204,0,0.08); border:1px solid rgba(255,204,0,0.25); color:#ffcc00; padding:0.4rem 0.8rem; border-radius:6px; font-size:0.78rem; font-weight:600; cursor:pointer; white-space:nowrap; transition:all 0.2s; }
         .view-btn:hover { background:rgba(255,204,0,0.18); }
+        .edit-btn { background:rgba(80,160,255,0.1); border:1px solid rgba(80,160,255,0.3); color:#66aaff; padding:0.4rem 0.8rem; border-radius:6px; font-size:0.78rem; font-weight:600; cursor:pointer; white-space:nowrap; transition:all 0.2s; }
+        .edit-btn:hover { background:rgba(80,160,255,0.2); border-color:#66aaff; }
+        .view-btn:hover { background:rgba(255,204,0,0.18); }
         .day-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:0.75rem; display:flex; flex-direction:column; gap:0.4rem; min-width:140px; max-width:160px; }
         .day-card-date { font-size:0.75rem; font-weight:700; color:var(--muted); letter-spacing:0.05em; }
         .day-card-steps { font-family:'Bebas Neue',cursive; font-size:1.1rem; color:var(--accent); letter-spacing:0.05em; }
@@ -663,12 +1218,11 @@ export default function App() {
 
       <div className="hero">
         <div className="hero-inner">
-          <div className="hero-badge">🏆 Step Challenge 2026</div>
           <h1>TULSA TECH <span>STUDENT</span> WALKING CHALLENGE</h1>
           <p className="hero-sub">Log your steps daily, build your total, and climb the leaderboard!</p>
           <div className="stats-bar">
             <div className="stat-item"><span className="stat-val">{totalStudents}</span><span className="stat-lbl">Students</span></div>
-            <div className="stat-item"><span className="stat-val">{highestSteps.toLocaleString()}</span><span className="stat-lbl">Highest Total</span></div>
+            <div className="stat-item"><span className="stat-val">{totalSteps.toLocaleString()}</span><span className="stat-lbl">Total Steps</span></div>
             <div className="stat-item"><span className="stat-val">{avgSteps.toLocaleString()}</span><span className="stat-lbl">Avg Total Steps</span></div>
           </div>
         </div>
@@ -677,24 +1231,26 @@ export default function App() {
       <div className="tabs-bar">
         <div className="tabs-inner">
           {TABS.map((tab, i) => (
-            <button key={tab} className={`tab-btn ${i===6?"admin-tab":""} ${activeTab===i?"active":""}`} onClick={() => { setActiveTab(i); if(i!==6) setAdminAuthed(false); }}>
-              {i===6 ? "🔒 Admin" : tab}
+            <button key={tab} className={`tab-btn ${i===8?"admin-tab":""} ${activeTab===i?"active":""}`} onClick={() => { setActiveTab(i); if(i!==8) setAdminAuthed(false); }}>
+              {i===8 ? "🔒 Admin" : tab}
             </button>
           ))}
         </div>
       </div>
 
       <div className="content">
-        {loading ? <Loader /> :
+        {loading ? <Loader message="Loading challenge data..." /> :
           activeTab===0 ? <SubmitForm onSubmit={handleSubmit} students={students} /> :
           activeTab===1 ? <LeaderboardTable title="🏫 Campus Average Steps" students={students} groupBy="campus" /> :
           activeTab===2 ? <LeaderboardTable title="🏆 Top 10 Highest Steps" students={students} /> :
           activeTab===3 ? <LeaderboardTable title="🌅 Top 10 AM Students" students={students} filter="AM" /> :
           activeTab===4 ? <LeaderboardTable title="🌆 Top 10 PM Students" students={students} filter="PM" /> :
           activeTab===5 ? <LeaderboardTable title="☀️ Top 10 All Day Students" students={students} filter="All Day" /> :
-          activeTab===6 ? (
+          activeTab===6 ? <AllStudentsLeaderboard students={students} /> :
+          activeTab===7 ? <MySubmissions students={students} /> :
+          activeTab===8 ? (
             adminAuthed
-              ? <AdminPanel students={students} onDelete={handleDelete} onDeleteDay={handleDeleteDay} onLogout={() => { setAdminAuthed(false); setActiveTab(0); }} />
+              ? <AdminPanel students={students} onDelete={handleDelete} onDeleteDay={handleDeleteDay} onEditStudent={handleEditStudent} onEditDay={handleEditDay} onLogout={() => { setAdminAuthed(false); setActiveTab(0); }} />
               : <AdminLogin onLogin={() => setAdminAuthed(true)} />
           ) : null
         }
